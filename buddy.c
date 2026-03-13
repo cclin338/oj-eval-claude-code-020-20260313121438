@@ -19,40 +19,69 @@ static void *base_addr = NULL;
 // Total number of pages (in 4K units)
 static int total_pages = 0;
 
-// Allocation bitmap - tracks which blocks are allocated at each rank
-// For a page at index i, we store its allocation status (0=free, >0=rank)
+// Allocation bitmap:
+// alloc_map[i] > 0: allocated with that rank
+// alloc_map[i] = 0: not the start of a block
+// alloc_map[i] < 0: free block start with rank = -alloc_map[i]
 static char alloc_map[MAX_PAGES];
 
 // Helper function to calculate power of 2
-static int pow2(int rank) {
+static inline int pow2(int rank) {
     return 1 << (rank - 1);
 }
 
 // Get the index of a page address (in 4K units)
-static int get_page_index(void *p) {
-    if (base_addr == NULL || p < base_addr) return -1;
+static inline int get_page_index(void *p) {
     long offset = (char *)p - (char *)base_addr;
-    if (offset < 0 || offset % PAGE_SIZE != 0) return -1;
-    int idx = offset / PAGE_SIZE;
-    if (idx >= total_pages) return -1;
-    return idx;
+    return offset / PAGE_SIZE;
 }
 
 // Get address from page index
-static void *get_page_addr(int idx) {
+static inline void *get_page_addr(int idx) {
     return (char *)base_addr + (long)idx * PAGE_SIZE;
 }
 
 // Get buddy index for a block
-static int get_buddy_index(int idx, int rank) {
+static inline int get_buddy_index(int idx, int rank) {
     int block_size = pow2(rank);
     return idx ^ block_size;
 }
 
 // Check if a block is aligned for the given rank
-static int is_aligned(int idx, int rank) {
+static inline int is_aligned(int idx, int rank) {
     int block_size = pow2(rank);
-    return (idx % block_size) == 0;
+    return (idx & (block_size - 1)) == 0;
+}
+
+// Mark block as free in alloc_map
+static inline void mark_free(int idx, int rank) {
+    alloc_map[idx] = -rank;  // Negative indicates free block start
+    int block_size = pow2(rank);
+    for (int i = 1; i < block_size; i++) {
+        alloc_map[idx + i] = 0;
+    }
+}
+
+// Mark block as allocated in alloc_map
+static inline void mark_allocated(int idx, int rank) {
+    int block_size = pow2(rank);
+    for (int i = 0; i < block_size; i++) {
+        alloc_map[idx + i] = rank;
+    }
+}
+
+// Clear block in alloc_map
+static inline void mark_cleared(int idx, int rank) {
+    int block_size = pow2(rank);
+    for (int i = 0; i < block_size; i++) {
+        alloc_map[idx + i] = 0;
+    }
+}
+
+// Check if buddy is free at the given rank
+static inline int is_buddy_free_at_rank(int buddy_idx, int rank) {
+    if (buddy_idx < 0 || buddy_idx >= total_pages) return 0;
+    return alloc_map[buddy_idx] == -rank;
 }
 
 // Initialize the buddy system
@@ -68,8 +97,8 @@ int init_page(void *p, int pgcount) {
     }
 
     // Initialize allocation map
-    for (int i = 0; i < total_pages && i < MAX_PAGES; i++) {
-        alloc_map[i] = 0;  // 0 means free
+    for (int i = 0; i < total_pages; i++) {
+        alloc_map[i] = 0;
     }
 
     // Add blocks to free lists, starting from largest possible
@@ -78,7 +107,6 @@ int init_page(void *p, int pgcount) {
 
     while (remaining_pages > 0) {
         int rank = MAX_RANK;
-        int found = 0;
 
         while (rank >= 1) {
             int block_size = pow2(rank);
@@ -88,15 +116,15 @@ int init_page(void *p, int pgcount) {
                 node->next = free_lists[rank];
                 free_lists[rank] = node;
 
+                // Mark as free
+                mark_free(current_idx, rank);
+
                 current_idx += block_size;
                 remaining_pages -= block_size;
-                found = 1;
                 break;
             }
             rank--;
         }
-
-        if (!found) break;  // Can't place any more blocks
     }
 
     return OK;
@@ -115,12 +143,15 @@ void *alloc_pages(int rank) {
     }
 
     if (current_rank > MAX_RANK) {
-        return ERR_PTR(-ENOSPC);  // No space available
+        return ERR_PTR(-ENOSPC);
     }
 
     // Remove block from free list
     free_node_t *block = free_lists[current_rank];
     free_lists[current_rank] = block->next;
+
+    int idx = get_page_index(block);
+    mark_cleared(idx, current_rank);
 
     // Split blocks down to requested rank
     while (current_rank > rank) {
@@ -128,20 +159,18 @@ void *alloc_pages(int rank) {
         int block_size = pow2(current_rank);
 
         // Split: add second half (buddy) to free list
-        void *buddy = (char *)block + (long)block_size * PAGE_SIZE;
+        int buddy_idx = idx + block_size;
+        void *buddy = get_page_addr(buddy_idx);
         free_node_t *buddy_node = (free_node_t *)buddy;
         buddy_node->next = free_lists[current_rank];
         free_lists[current_rank] = buddy_node;
+
+        // Mark buddy as free
+        mark_free(buddy_idx, current_rank);
     }
 
-    // Mark block as allocated in alloc_map
-    int idx = get_page_index(block);
-    if (idx >= 0 && idx < MAX_PAGES) {
-        int block_size = pow2(rank);
-        for (int i = 0; i < block_size && (idx + i) < MAX_PAGES; i++) {
-            alloc_map[idx + i] = rank;
-        }
-    }
+    // Mark block as allocated
+    mark_allocated(idx, rank);
 
     return (void *)block;
 }
@@ -162,50 +191,39 @@ int return_pages(void *p) {
 
     int block_size = pow2(rank);
 
-    // Verify all pages in block have same rank (means it's a valid allocated block)
-    for (int i = 0; i < block_size && (idx + i) < total_pages; i++) {
+    // Verify all pages in block have same rank
+    for (int i = 1; i < block_size; i++) {
         if (alloc_map[idx + i] != rank) return -EINVAL;
     }
 
-    // Clear allocation map
-    for (int i = 0; i < block_size && (idx + i) < total_pages; i++) {
-        alloc_map[idx + i] = 0;
-    }
+    // Clear allocation map for current block
+    mark_cleared(idx, rank);
 
-    // Try to merge with buddy
+    // Try to merge with buddy iteratively
     while (rank < MAX_RANK) {
         int buddy_idx = get_buddy_index(idx, rank);
 
-        // Check if buddy exists in valid range
+        // Check bounds
         if (buddy_idx < 0 || buddy_idx >= total_pages) break;
-        if (!is_aligned(buddy_idx, rank)) break;
+        if (buddy_idx + block_size > total_pages) break;
 
-        // Check if entire buddy block is free
-        int is_buddy_free = 1;
-        for (int i = 0; i < block_size; i++) {
-            if ((buddy_idx + i) >= total_pages || alloc_map[buddy_idx + i] != 0) {
-                is_buddy_free = 0;
-                break;
-            }
-        }
+        // Check if buddy is free at this rank using quick lookup
+        if (!is_buddy_free_at_rank(buddy_idx, rank)) break;
 
-        if (!is_buddy_free) break;
-
-        // Find and remove buddy from free list
+        // Remove buddy from free list - we know it's there
         void *buddy_addr = get_page_addr(buddy_idx);
         free_node_t **curr = &free_lists[rank];
-        int found = 0;
 
         while (*curr != NULL) {
             if ((void *)(*curr) == buddy_addr) {
                 *curr = (*curr)->next;
-                found = 1;
                 break;
             }
             curr = &((*curr)->next);
         }
 
-        if (!found) break;  // Buddy not in free list, can't merge
+        // Clear buddy's free marker
+        mark_cleared(buddy_idx, rank);
 
         // Merge: new block starts at lower address
         if (buddy_idx < idx) {
@@ -222,6 +240,9 @@ int return_pages(void *p) {
     node->next = free_lists[rank];
     free_lists[rank] = node;
 
+    // Mark as free
+    mark_free(idx, rank);
+
     return OK;
 }
 
@@ -232,41 +253,41 @@ int query_ranks(void *p) {
     int idx = get_page_index(p);
     if (idx < 0 || idx >= total_pages) return -EINVAL;
 
-    int rank = alloc_map[idx];
+    int val = alloc_map[idx];
 
     // If allocated, return its rank
-    if (rank > 0 && rank <= MAX_RANK) return rank;
+    if (val > 0 && val <= MAX_RANK) return val;
 
-    // If free, find maximum rank block containing this page
+    // If it's a free block start, return its rank
+    if (val < 0) return -val;
+
+    // val == 0 means it's inside a block (not the start)
+    // Need to find which block it belongs to
     for (int r = MAX_RANK; r >= 1; r--) {
-        // Calculate the starting index of the block that would contain this page
         int block_size = pow2(r);
         int block_start = (idx / block_size) * block_size;
 
-        // Check if this block is aligned and within bounds
         if (!is_aligned(block_start, r)) continue;
         if (block_start + block_size > total_pages) continue;
 
-        // Check if entire block is free
-        int all_free = 1;
-        for (int i = 0; i < block_size; i++) {
-            if ((block_start + i) >= total_pages || alloc_map[block_start + i] != 0) {
-                all_free = 0;
-                break;
-            }
+        int start_val = alloc_map[block_start];
+
+        // Check if it's a free block of this rank
+        if (start_val == -r) {
+            return r;
         }
 
-        if (!all_free) continue;
-
-        // Check if this block exists in free list
-        free_node_t *curr = free_lists[r];
-        void *target_addr = get_page_addr(block_start);
-
-        while (curr != NULL) {
-            if ((void *)curr == target_addr) {
-                return r;
+        // Check if it's an allocated block of this rank
+        if (start_val == r) {
+            // Verify all pages have same rank
+            int valid = 1;
+            for (int i = 0; i < block_size; i++) {
+                if (alloc_map[block_start + i] != r) {
+                    valid = 0;
+                    break;
+                }
             }
-            curr = curr->next;
+            if (valid) return r;
         }
     }
 
