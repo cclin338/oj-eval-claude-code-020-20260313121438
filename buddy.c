@@ -5,12 +5,13 @@
 #define PAGE_SIZE 4096  // 4K
 #define MAX_PAGES 65536  // Maximum possible pages (256MB / 4K)
 
-// Structure for a free list node
+// Structure for a doubly-linked free list node
 typedef struct free_node {
     struct free_node *next;
+    struct free_node *prev;
 } free_node_t;
 
-// Free lists for each rank
+// Free lists for each rank (head pointers)
 static free_node_t *free_lists[MAX_RANK + 1];
 
 // Base address of managed memory
@@ -53,9 +54,31 @@ static inline int is_aligned(int idx, int rank) {
     return (idx & (block_size - 1)) == 0;
 }
 
+// Add node to free list
+static inline void list_add(free_node_t **head, free_node_t *node) {
+    node->next = *head;
+    node->prev = NULL;
+    if (*head != NULL) {
+        (*head)->prev = node;
+    }
+    *head = node;
+}
+
+// Remove node from free list
+static inline void list_remove(free_node_t **head, free_node_t *node) {
+    if (node->prev != NULL) {
+        node->prev->next = node->next;
+    } else {
+        *head = node->next;
+    }
+    if (node->next != NULL) {
+        node->next->prev = node->prev;
+    }
+}
+
 // Mark block as free in alloc_map
 static inline void mark_free(int idx, int rank) {
-    alloc_map[idx] = -rank;  // Negative indicates free block start
+    alloc_map[idx] = -rank;
     int block_size = pow2(rank);
     for (int i = 1; i < block_size; i++) {
         alloc_map[idx + i] = 0;
@@ -113,8 +136,7 @@ int init_page(void *p, int pgcount) {
             if (block_size <= remaining_pages && is_aligned(current_idx, rank)) {
                 // Add this block to free list
                 free_node_t *node = (free_node_t *)get_page_addr(current_idx);
-                node->next = free_lists[rank];
-                free_lists[rank] = node;
+                list_add(&free_lists[rank], node);
 
                 // Mark as free
                 mark_free(current_idx, rank);
@@ -148,7 +170,7 @@ void *alloc_pages(int rank) {
 
     // Remove block from free list
     free_node_t *block = free_lists[current_rank];
-    free_lists[current_rank] = block->next;
+    list_remove(&free_lists[current_rank], block);
 
     int idx = get_page_index(block);
     mark_cleared(idx, current_rank);
@@ -162,8 +184,7 @@ void *alloc_pages(int rank) {
         int buddy_idx = idx + block_size;
         void *buddy = get_page_addr(buddy_idx);
         free_node_t *buddy_node = (free_node_t *)buddy;
-        buddy_node->next = free_lists[current_rank];
-        free_lists[current_rank] = buddy_node;
+        list_add(&free_lists[current_rank], buddy_node);
 
         // Mark buddy as free
         mark_free(buddy_idx, current_rank);
@@ -207,20 +228,13 @@ int return_pages(void *p) {
         if (buddy_idx < 0 || buddy_idx >= total_pages) break;
         if (buddy_idx + block_size > total_pages) break;
 
-        // Check if buddy is free at this rank using quick lookup
+        // Check if buddy is free at this rank using O(1) lookup
         if (!is_buddy_free_at_rank(buddy_idx, rank)) break;
 
-        // Remove buddy from free list - we know it's there
+        // Remove buddy from free list in O(1) time using doubly-linked list
         void *buddy_addr = get_page_addr(buddy_idx);
-        free_node_t **curr = &free_lists[rank];
-
-        while (*curr != NULL) {
-            if ((void *)(*curr) == buddy_addr) {
-                *curr = (*curr)->next;
-                break;
-            }
-            curr = &((*curr)->next);
-        }
+        free_node_t *buddy_node = (free_node_t *)buddy_addr;
+        list_remove(&free_lists[rank], buddy_node);
 
         // Clear buddy's free marker
         mark_cleared(buddy_idx, rank);
@@ -237,8 +251,7 @@ int return_pages(void *p) {
     // Add merged block to free list
     void *block_addr = get_page_addr(idx);
     free_node_t *node = (free_node_t *)block_addr;
-    node->next = free_lists[rank];
-    free_lists[rank] = node;
+    list_add(&free_lists[rank], node);
 
     // Mark as free
     mark_free(idx, rank);
